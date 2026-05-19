@@ -1,0 +1,6 @@
+
+[dev]
+pytest>=8
+
+[qt]
+PySide6>=6.5
