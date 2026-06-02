@@ -79,6 +79,9 @@ class BaseLogNormalizerSink(ABC):
         except Exception:
             traceback.print_exc()
 
+    def close(self) -> None:
+        """No-op close; subclasses may override to release resources."""
+
     # ------------------------------------------------------------------ #
     # Internal normalisation
     # ------------------------------------------------------------------ #

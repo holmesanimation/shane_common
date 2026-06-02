@@ -135,6 +135,10 @@ class HeartbeatWriter:
                 "HeartbeatWriter.start() failed to clear stale exit marker for %s.",
                 self._app_id,
             )
+        # Write the first heartbeat synchronously so that a concurrent singleton
+        # check on another process sees a fresh mtime and this PID immediately,
+        # before the background thread has had a chance to run.
+        self._write_once()
         self._running = True
         self._thread = threading.Thread(
             target=self._write_loop,

@@ -12,6 +12,7 @@ import pytest
 
 from shane_common.processes.windows import (
     list_process_pids,
+    has_visible_window,
     is_process_running,
     taskkill_processes,
     enum_visible_windows_for_pids,
@@ -34,6 +35,10 @@ class TestNonWindowsNoOps:
     def test_is_process_running_returns_false(self):
         with patch("shane_common.processes.windows.os.name", "posix"):
             assert is_process_running("chrome.exe") is False
+
+    def test_has_visible_window_returns_false(self):
+        with patch("shane_common.processes.windows.os.name", "posix"):
+            assert has_visible_window("chrome.exe") is False
 
     def test_taskkill_processes_is_noop(self):
         with patch("shane_common.processes.windows.os.name", "posix"):
@@ -116,6 +121,35 @@ class TestIsProcessRunning:
         with patch("shane_common.processes.windows.os.name", "nt"):
             with patch("shane_common.processes.windows.subprocess.run", side_effect=OSError):
                 assert is_process_running("chrome.exe") is False
+
+
+# ---------------------------------------------------------------------------
+# has_visible_window — visible browser window presence
+# ---------------------------------------------------------------------------
+
+class TestHasVisibleWindow:
+    def test_returns_true_when_visible_window_found(self):
+        with patch("shane_common.processes.windows.os.name", "nt"):
+            with patch("shane_common.processes.windows.list_process_pids", return_value={1234}):
+                with patch(
+                    "shane_common.processes.windows.enum_visible_windows_for_pids",
+                    return_value=[1001],
+                ):
+                    assert has_visible_window("chrome.exe") is True
+
+    def test_returns_false_when_only_background_processes_exist(self):
+        with patch("shane_common.processes.windows.os.name", "nt"):
+            with patch("shane_common.processes.windows.list_process_pids", return_value={1234}):
+                with patch(
+                    "shane_common.processes.windows.enum_visible_windows_for_pids",
+                    return_value=[],
+                ):
+                    assert has_visible_window("msedge.exe") is False
+
+    def test_returns_false_when_pid_lookup_fails(self):
+        with patch("shane_common.processes.windows.os.name", "nt"):
+            with patch("shane_common.processes.windows.list_process_pids", side_effect=OSError):
+                assert has_visible_window("chrome.exe") is False
 
 
 # ---------------------------------------------------------------------------

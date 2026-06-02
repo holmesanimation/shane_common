@@ -51,6 +51,23 @@ def list_process_pids(image_name: str) -> set:
         return set()
 
 
+def has_visible_window(image_name: str) -> bool:
+    """Return True if *image_name* owns at least one visible top-level window.
+
+    This is stricter than :func:`is_process_running` and avoids treating
+    background browser helper processes as an active foreground browser.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        pids = list_process_pids(image_name)
+        if not pids:
+            return False
+        return bool(enum_visible_windows_for_pids(pids))
+    except Exception:
+        return False
+
+
 def is_process_running(image_name: str) -> bool:
     """Return True if at least one process with *image_name* is running.
 

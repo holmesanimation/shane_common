@@ -42,7 +42,12 @@ def write_text_atomic(
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(text, encoding=encoding)
-    _replace_with_retry(tmp, path, retries=retries, delay=delay)
+    try:
+        _replace_with_retry(tmp, path, retries=retries, delay=delay)
+    except Exception:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+        raise
 
 
 def _replace_with_retry(src: Path, dst: Path, *, retries: int, delay: float) -> None:

@@ -21,6 +21,8 @@ The system is split into three tiers:
 
 The guiding principle: **anything that does not reference broker state, trading models, or risk locks belongs in `shane_common`**.
 
+The compact floating pill used by the supervisor tray now follows that rule as well: the reusable widget lives in `shane_common.ui.floating_status_pill.FloatingStatusPill`, while supervisor-specific labels, colors, and actions stay in the trading tray layer.
+
 ---
 
 ## Directory Layout on Disk
@@ -217,6 +219,30 @@ launched = launcher.maybe_restart(cfg)   # True if spawn was attempted
 ### `tray/` — Qt Abstractions
 
 > **Requires PySide6.** Install with `pip install shane_common[qt]`
+
+### `ui/` — Shared Qt Widgets
+
+Generic widgets that are useful outside watchdog flows live under `shane_common.ui`.
+
+#### `floating_status_pill.py` — `FloatingStatusPill`
+
+Reusable frameless always-on-top pill widget for compact status surfaces.
+
+```python
+from shane_common.ui.floating_status_pill import FloatingStatusPill
+
+pill = FloatingStatusPill(
+  tooltip="Purity Timer\nDouble-click to open  |  Drag to reposition",
+  toggle_action_text="Open Timer",
+)
+pill.update_status("Focus 12:34", "#2563eb")
+pill.show()
+```
+
+- Drag to reposition.
+- Double-click emits `toggle_requested`.
+- Right-click shows a small menu with the configurable primary action and quit action.
+- Position persistence helpers use `QSettings` via `save_position()` / `restore_position()`.
 
 #### `tray/icons.py`
 
@@ -528,6 +554,8 @@ sys.exit(app.exec())
 - **Compact** (default): a small always-on-top frameless `StatusPill` overlay.
 - **Expanded**: full `SupervisorWindow` dashboard with per-app liveness rows, lock panel,
   recent events, and domain state badges.
+
+The supervisor's `StatusPill` is now a thin wrapper around `shane_common.ui.floating_status_pill.FloatingStatusPill`, adding only supervisor-specific tooltip text and menu labels.
 
 Toggle with left-click on the tray icon, double-click, or the pill context menu.
 
