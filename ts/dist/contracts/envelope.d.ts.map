@@ -1,0 +1,1 @@
+{"version":3,"file":"envelope.d.ts","sourceRoot":"","sources":["../../src/contracts/envelope.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,WAAW,CAAC,CAAC;IAC5B,IAAI,EAAE,MAAM,CAAC;IACb,EAAE,EAAE,MAAM,CAAC;IACX,GAAG,EAAE,MAAM,CAAC;IACZ,IAAI,EAAE,UAAU,GAAG,OAAO,CAAC;IAC3B,cAAc,EAAE,MAAM,CAAC;IACvB,OAAO,EAAE,CAAC,CAAC;CACZ"}
