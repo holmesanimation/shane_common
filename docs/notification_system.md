@@ -39,6 +39,7 @@ App startup
 | `shane_common.notify.adapters.bark_adapter` | `BarkNotifyAdapter`, `BarkConfig` |
 | `shane_common.notify.adapters.telegram_adapter` | `TelegramNotifyAdapter` |
 | `shane_common.notify.adapters.composite_adapter` | `CompositeNotifyAdapter` |
+| `shane_common.notify.builder` | `build_telegram_adapter` convenience factory |
 
 ---
 
@@ -88,6 +89,21 @@ adapter = TelegramNotifyAdapter(
     alert_severities=frozenset({"WARNING", "URGENT"}),
     # format_message=None  →  plain-text default
     # build_reply_markup=None  →  no inline keyboard
+)
+```
+
+#### Telegram convenience factory (recommended)
+
+When your app has already parsed token/chat IDs, prefer the shared builder.
+It returns `NullNotifyAdapter` automatically when token or chat IDs are empty.
+
+```python
+from shane_common.notify.builder import build_telegram_adapter
+
+adapter = build_telegram_adapter(
+    token=os.environ.get("TELEGRAM_BOT_TOKEN", "").strip(),
+    chat_ids=[123456789],
+    alert_severities=frozenset({"WARNING", "URGENT"}),
 )
 ```
 

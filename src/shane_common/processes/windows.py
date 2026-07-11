@@ -6,48 +6,118 @@ empty collection or False so callers need no platform guards.
 
 import os
 import subprocess
+import threading
+import time
+import traceback
+
+
+_SLOW_WINDOWS_PROCESS_CALL_THRESHOLD_MS = 50.0
+_PROCESS_SNAPSHOT_CACHE_TTL_S = 0.25
 
 if os.name == "nt":
     import ctypes
     from ctypes import wintypes
 
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     _user32 = ctypes.WinDLL("user32", use_last_error=True)
     _EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    _TH32CS_SNAPPROCESS = 0x00000002
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    _MAX_PATH = 260
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * _MAX_PATH),
+        ]
+
+    _kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    _kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    _kernel32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _kernel32.Process32FirstW.restype = wintypes.BOOL
+    _kernel32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PROCESSENTRY32W)]
+    _kernel32.Process32NextW.restype = wintypes.BOOL
+    _kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    _kernel32.CloseHandle.restype = wintypes.BOOL
+
+    _process_snapshot_cache_lock = threading.Lock()
+    _process_snapshot_cache: tuple[float, dict[str, set[int]]] = (0.0, {})
 
 
 # ---------------------------------------------------------------------------
 # Process discovery
 # ---------------------------------------------------------------------------
 
+
+def _log_slow_windows_process_call(operation: str, started_at: float, *, target: str = "") -> None:
+    elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+    if elapsed_ms < _SLOW_WINDOWS_PROCESS_CALL_THRESHOLD_MS:
+        return
+    suffix = f" target={target}" if target else ""
+    print(
+        f"[WindowsProcesses] slow operation: {operation} took {elapsed_ms:.1f} ms{suffix}",
+        flush=True,
+    )
+
+
+def _snapshot_processes_by_image_name() -> dict[str, set[int]]:
+    if os.name != "nt":
+        return {}
+
+    global _process_snapshot_cache
+    now = time.monotonic()
+    with _process_snapshot_cache_lock:
+        cached_at, cached_snapshot = _process_snapshot_cache
+        if (now - cached_at) < _PROCESS_SNAPSHOT_CACHE_TTL_S:
+            return cached_snapshot
+
+    snapshot: dict[str, set[int]] = {}
+    handle = _kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if handle == _INVALID_HANDLE_VALUE:
+        return snapshot
+
+    entry = _PROCESSENTRY32W()
+    entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+    try:
+        if not _kernel32.Process32FirstW(handle, ctypes.byref(entry)):
+            return snapshot
+
+        while True:
+            name = str(entry.szExeFile).strip().lower()
+            if name:
+                snapshot.setdefault(name, set()).add(int(entry.th32ProcessID))
+            if not _kernel32.Process32NextW(handle, ctypes.byref(entry)):
+                break
+    finally:
+        _kernel32.CloseHandle(handle)
+
+    with _process_snapshot_cache_lock:
+        _process_snapshot_cache = (now, snapshot)
+    return snapshot
+
 def list_process_pids(image_name: str) -> set:
     """Return the set of integer PIDs for processes matching *image_name*.
 
-    Uses ``tasklist /FO CSV`` for reliable CSV parsing.
+    Uses a native Toolhelp snapshot on Windows to avoid blocking subprocess calls.
     Returns an empty set on non-Windows or on any error.
     """
     if os.name != "nt":
         return set()
+    started_at = time.perf_counter()
     try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {image_name}", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            timeout=5,
-        )
-        pids: set = set()
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            parts = [p.strip('"') for p in line.split('","')]
-            if len(parts) >= 2:
-                try:
-                    pids.add(int(parts[1]))
-                except ValueError:
-                    pass
-        return pids
+        pids = _snapshot_processes_by_image_name().get(str(image_name).strip().lower(), set())
+        _log_slow_windows_process_call("list_process_pids", started_at, target=image_name)
+        return set(pids)
     except Exception:
+        _log_slow_windows_process_call("list_process_pids", started_at, target=image_name)
         return set()
 
 
@@ -65,27 +135,25 @@ def has_visible_window(image_name: str) -> bool:
             return False
         return bool(enum_visible_windows_for_pids(pids))
     except Exception:
+        traceback.print_exc()
         return False
 
 
 def is_process_running(image_name: str) -> bool:
     """Return True if at least one process with *image_name* is running.
 
-    Uses ``tasklist /FI`` which is fast for a simple presence check.
+    Uses the native process snapshot shared with :func:`list_process_pids`.
     Returns False on non-Windows or on any error.
     """
     if os.name != "nt":
         return False
+    started_at = time.perf_counter()
     try:
-        result = subprocess.run(
-            ["tasklist", "/FI", f"IMAGENAME eq {image_name}"],
-            capture_output=True,
-            text=True,
-            creationflags=subprocess.CREATE_NO_WINDOW,
-            timeout=5,
-        )
-        return image_name.lower() in result.stdout.lower()
+        running = bool(_snapshot_processes_by_image_name().get(str(image_name).strip().lower()))
+        _log_slow_windows_process_call("is_process_running", started_at, target=image_name)
+        return running
     except Exception:
+        _log_slow_windows_process_call("is_process_running", started_at, target=image_name)
         return False
 
 
@@ -97,13 +165,16 @@ def taskkill_processes(image_names) -> None:
     if os.name != "nt":
         return
     for name in image_names:
+        started_at = time.perf_counter()
         try:
             subprocess.run(
                 ["taskkill", "/IM", name, "/F"],
                 creationflags=subprocess.CREATE_NO_WINDOW,
                 capture_output=True,
             )
+            _log_slow_windows_process_call("taskkill_processes", started_at, target=str(name))
         except Exception:
+            _log_slow_windows_process_call("taskkill_processes", started_at, target=str(name))
             pass
 
 

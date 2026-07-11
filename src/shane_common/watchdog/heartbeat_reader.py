@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 
 _READ_RETRIES: int = 4
 _READ_RETRY_DELAY_S: float = 0.03
+_SLOW_HEARTBEAT_READ_THRESHOLD_MS: float = 50.0
 
 
 class HeartbeatReader:
@@ -64,10 +65,12 @@ class HeartbeatReader:
         - ``file_mtime_utc`` is ``None`` when ``heartbeat`` is ``None``.
         - ``exit_marker_present`` is True when the marker file exists.
         """
+        started_at = time.perf_counter()
         heartbeat_path = self._heartbeats_dir / f"{app_id}.heartbeat.json"
         exit_marker_path = self._heartbeats_dir / f"{app_id}.exit_marker.json"
 
         if not heartbeat_path.exists():
+            self._log_slow_read(app_id, started_at)
             return (None, None, False)
 
         heartbeat: Optional[LivenessHeartbeat] = None
@@ -100,6 +103,7 @@ class HeartbeatReader:
             )
 
         exit_marker_present = exit_marker_path.exists()
+        self._log_slow_read(app_id, started_at)
         return (heartbeat, file_mtime, exit_marker_present)
 
     def is_stale(self, file_mtime_utc: float) -> bool:
@@ -136,4 +140,14 @@ class HeartbeatReader:
             pid=int(data["pid"]),
             ts_wall_utc=float(data["ts_wall_utc"]),
             seq=int(data["seq"]),
+        )
+
+    def _log_slow_read(self, app_id: str, started_at: float) -> None:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        if elapsed_ms < _SLOW_HEARTBEAT_READ_THRESHOLD_MS:
+            return
+        log.warning(
+            "HeartbeatReader: slow read for %s took %.1f ms",
+            app_id,
+            elapsed_ms,
         )

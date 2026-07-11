@@ -36,6 +36,8 @@ _M_COL_NOTE_TYPE = 2
 _M_COL_TEXT      = 3
 _M_NUM_BASE_COLS = 4
 
+_UNTAGGED_SENTINEL = "(untagged)"
+
 
 class NotesBrowserWindow(QtWidgets.QMainWindow):
     """Notes Browser window.
@@ -58,6 +60,8 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
         self._current_owner: str | None = None
         self._owner_rows: list[NoteRow] = []
+        self._visible_rows: list[NoteRow] = []
+        self._active_tag_filter: set[str] | None = None
         self._lock_time_ts: float | None = None
         self._writer: object | None = None
 
@@ -160,8 +164,9 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
         self._middle_table = QtWidgets.QTableWidget(0, _M_NUM_BASE_COLS, middle_panel)
         self._middle_table.setHorizontalHeaderLabels(
-            ["Local TS", "UTC Time", "Type", "Text"]
+            ["Time", "UTC Time", "Tags", "Title"]
         )
+        self._middle_table.setColumnHidden(_M_COL_UTC_TIME, True)
         self._middle_table.setEditTriggers(QtWidgets.QAbstractItemView.EditTrigger.NoEditTriggers)
         self._middle_table.setSelectionMode(QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection)
         self._middle_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectionBehavior.SelectRows)
@@ -172,6 +177,7 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         hdr.setSectionResizeMode(_M_COL_UTC_TIME,  QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(_M_COL_NOTE_TYPE, QtWidgets.QHeaderView.ResizeMode.ResizeToContents)
         hdr.setSectionResizeMode(_M_COL_TEXT,      QtWidgets.QHeaderView.ResizeMode.Stretch)
+        hdr.sectionClicked.connect(self._on_header_section_clicked)
         self._middle_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._middle_table.customContextMenuRequested.connect(self._on_middle_context_menu)
         self._middle_table.selectionModel().currentRowChanged.connect(self._on_middle_row_changed)
@@ -294,6 +300,8 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
     def _load_owner(self, owner_key: str) -> None:
         self._current_owner = owner_key
         self._lbl_middle_title.setText(owner_key)
+        self._active_tag_filter = None
+        self._middle_table.horizontalHeaderItem(_M_COL_NOTE_TYPE).setText("Tags")
 
         try:
             all_rows = self._repository.rows_for_owner(owner_key)
@@ -315,8 +323,20 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
             self._select_nearest_locked_row()
 
     def _rebuild_middle_table(self) -> None:
+        if self._active_tag_filter is None:
+            self._visible_rows = list(self._owner_rows)
+        else:
+            self._visible_rows = []
+            for note in self._owner_rows:
+                tags = note.context.get("tags", []) if isinstance(note.context, dict) else []
+                if tags:
+                    if any(t in self._active_tag_filter for t in tags):
+                        self._visible_rows.append(note)
+                else:
+                    if _UNTAGGED_SENTINEL in self._active_tag_filter:
+                        self._visible_rows.append(note)
         self._middle_table.setRowCount(0)
-        for row_idx, note in enumerate(self._owner_rows):
+        for row_idx, note in enumerate(self._visible_rows):
             self._middle_table.insertRow(row_idx)
             self._set_middle_row(row_idx, note)
 
@@ -334,15 +354,50 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
             except Exception:
                 pass
 
+        tags = note.context.get("tags", []) if isinstance(note.context, dict) else []
+        tags_str = ", ".join(tags) if tags else "\u2014"
         self._middle_table.setItem(row_idx, _M_COL_LOCAL_TS, _cell(local_str))
         self._middle_table.setItem(row_idx, _M_COL_UTC_TIME, _cell(utc_str))
-        self._middle_table.setItem(row_idx, _M_COL_NOTE_TYPE, _cell(note.note_type or ""))
+        self._middle_table.setItem(row_idx, _M_COL_NOTE_TYPE, _cell(tags_str))
         text_preview = (note.text or "").replace("\n", " ")[:80]
         self._middle_table.setItem(row_idx, _M_COL_TEXT, _cell(text_preview))
 
     # ------------------------------------------------------------------
     # Lock Time
     # ------------------------------------------------------------------
+
+    def _on_header_section_clicked(self, logical_index: int) -> None:
+        if logical_index != _M_COL_NOTE_TYPE:
+            return
+        hdr = self._middle_table.horizontalHeader()
+        x = hdr.sectionViewportPosition(logical_index)
+        pos = hdr.mapToGlobal(QtCore.QPoint(x, hdr.height()))
+
+        unique_tags: set[str] = set()
+        has_untagged = False
+        for note in self._owner_rows:
+            tags = note.context.get("tags", []) if isinstance(note.context, dict) else []
+            if tags:
+                unique_tags.update(tags)
+            else:
+                has_untagged = True
+
+        popup = _TagFilterPopup(
+            tags=sorted(unique_tags),
+            has_untagged=has_untagged,
+            active_filter=self._active_tag_filter,
+            on_changed=self._apply_tag_filter,
+        )
+        popup.move(pos)
+        popup.show()
+        popup.raise_()
+
+    def _apply_tag_filter(self, active_filter: "set[str] | None") -> None:
+        self._active_tag_filter = active_filter
+        hdr_item = self._middle_table.horizontalHeaderItem(_M_COL_NOTE_TYPE)
+        if hdr_item:
+            hdr_item.setText("Tags" if active_filter is None else "Tags \u25cf")
+        self._rebuild_middle_table()
 
     def _on_browse_folder(self) -> None:
         """Open the notes root directory in the OS file explorer."""
@@ -360,8 +415,8 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
         sel_row = self._middle_table.currentRow()
         ts: float | None = None
-        if 0 <= sel_row < len(self._owner_rows):
-            ts = self._owner_rows[sel_row].ts
+        if 0 <= sel_row < len(self._visible_rows):
+            ts = self._visible_rows[sel_row].ts
         if ts is None:
             self._btn_lock_time.setChecked(False)
             return
@@ -378,9 +433,9 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self._highlight_nearest_row(sel_row)
 
     def _select_nearest_locked_row(self) -> None:
-        if self._lock_time_ts is None or not self._owner_rows:
+        if self._lock_time_ts is None or not self._visible_rows:
             return
-        nearest = _nearest_row_index(self._owner_rows, self._lock_time_ts)
+        nearest = _nearest_row_index(self._visible_rows, self._lock_time_ts)
         self._middle_table.setCurrentRow(nearest)
         self._highlight_nearest_row(nearest)
         self._middle_table.scrollToItem(
@@ -410,10 +465,10 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
     def _on_middle_row_changed(self, current: QtCore.QModelIndex, previous: QtCore.QModelIndex) -> None:
         current_row = current.row() if current.isValid() else -1
-        if current_row < 0 or current_row >= len(self._owner_rows):
+        if current_row < 0 or current_row >= len(self._visible_rows):
             self._contents_edit.clear()
             return
-        note = self._owner_rows[current_row]
+        note = self._visible_rows[current_row]
         self._contents_edit.setPlainText(format_note_contents(note))
 
     # ------------------------------------------------------------------
@@ -451,8 +506,8 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
     def _on_create_correlation(self, row_indices: list[int]) -> None:
         notes = [
-            self._owner_rows[i] for i in row_indices
-            if 0 <= i < len(self._owner_rows)
+            self._visible_rows[i] for i in row_indices
+            if 0 <= i < len(self._visible_rows)
         ]
         note_ids = [n.note_id for n in notes if n.note_id]
         if len(note_ids) < 2:
@@ -517,9 +572,9 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
     def _on_copy_to_collection(self) -> None:
         sel_row = self._middle_table.currentRow()
-        if sel_row < 0 or sel_row >= len(self._owner_rows):
+        if sel_row < 0 or sel_row >= len(self._visible_rows):
             return
-        note = self._owner_rows[sel_row]
+        note = self._visible_rows[sel_row]
         entry_text = build_collection_entry(note)
         existing = self._collection_edit.toPlainText()
         if existing.strip():
@@ -561,6 +616,143 @@ def _cell(text: str) -> QtWidgets.QTableWidgetItem:
     item = QtWidgets.QTableWidgetItem(text)
     item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
     return item
+
+
+# ---------------------------------------------------------------------------
+# Tag filter popup
+# ---------------------------------------------------------------------------
+
+class _TagFilterPopup(QtWidgets.QWidget):
+    """Popup shown when the Tags column header is clicked.
+
+    Behaves like a Google-Sheets-style column filter: all unique tag values are
+    listed as checkboxes.  Unchecking a tag hides rows that carry only that tag.
+    Changes are applied immediately; the popup auto-dismisses on outside click.
+    """
+
+    def __init__(
+        self,
+        tags: list[str],
+        has_untagged: bool,
+        active_filter: "set[str] | None",
+        on_changed,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent, Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        self._on_changed = on_changed
+
+        # Build the canonical full list (sentinel last)
+        self._all_items: list[str] = list(tags)
+        if has_untagged:
+            self._all_items.append(_UNTAGGED_SENTINEL)
+
+        # Initial checked state
+        if active_filter is None:
+            self._checked: set[str] = set(self._all_items)
+        else:
+            self._checked = set(active_filter)
+
+        self._checkboxes: dict[str, QtWidgets.QCheckBox] = {}
+        self._select_all_cb: QtWidgets.QCheckBox | None = None
+
+        self.setFixedWidth(220)
+        self.setStyleSheet(
+            "QCheckBox { padding: 3px 4px; }"
+        )
+
+        outer = QtWidgets.QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(4)
+
+        # Search box
+        self._search = QtWidgets.QLineEdit()
+        self._search.setPlaceholderText("Search tags\u2026")
+        self._search.textChanged.connect(self._on_search_changed)
+        outer.addWidget(self._search)
+
+        sep1 = QtWidgets.QFrame()
+        sep1.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        outer.addWidget(sep1)
+
+        # Select All
+        self._select_all_cb = QtWidgets.QCheckBox("(Select All)")
+        self._select_all_cb.setChecked(len(self._checked) == len(self._all_items))
+        self._select_all_cb.toggled.connect(self._on_select_all_toggled)
+        outer.addWidget(self._select_all_cb)
+
+        sep2 = QtWidgets.QFrame()
+        sep2.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        outer.addWidget(sep2)
+
+        # Scrollable tag list
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QScrollArea.Shape.NoFrame)
+        scroll.setFixedHeight(200)
+        scroll.setStyleSheet("QScrollArea { border: none; }")
+
+        self._tag_container = QtWidgets.QWidget()
+        self._tag_vbox = QtWidgets.QVBoxLayout(self._tag_container)
+        self._tag_vbox.setContentsMargins(0, 0, 0, 0)
+        self._tag_vbox.setSpacing(1)
+        scroll.setWidget(self._tag_container)
+        outer.addWidget(scroll)
+
+        self._rebuild_checkboxes(self._all_items)
+
+    # -- internal ----------------------------------------------------------
+
+    def _rebuild_checkboxes(self, items: list[str]) -> None:
+        while self._tag_vbox.count():
+            item = self._tag_vbox.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        self._checkboxes = {}
+        for tag in items:
+            cb = QtWidgets.QCheckBox(tag)
+            cb.setChecked(tag in self._checked)
+            cb.toggled.connect(lambda checked, t=tag: self._on_tag_toggled(t, checked))
+            self._tag_vbox.addWidget(cb)
+            self._checkboxes[tag] = cb
+        self._tag_vbox.addStretch()
+
+    def _on_search_changed(self, text: str) -> None:
+        text = text.strip().lower()
+        if text:
+            visible = [t for t in self._all_items if text in t.lower()]
+        else:
+            visible = list(self._all_items)
+        self._rebuild_checkboxes(visible)
+
+    def _on_select_all_toggled(self, checked: bool) -> None:
+        if checked:
+            self._checked = set(self._all_items)
+        else:
+            self._checked = set()
+        for cb in self._checkboxes.values():
+            cb.blockSignals(True)
+            cb.setChecked(checked)
+            cb.blockSignals(False)
+        self._fire()
+
+    def _on_tag_toggled(self, tag: str, checked: bool) -> None:
+        if checked:
+            self._checked.add(tag)
+        else:
+            self._checked.discard(tag)
+        if self._select_all_cb is not None:
+            self._select_all_cb.blockSignals(True)
+            self._select_all_cb.setChecked(
+                len(self._checked) == len(self._all_items)
+            )
+            self._select_all_cb.blockSignals(False)
+        self._fire()
+
+    def _fire(self) -> None:
+        if len(self._checked) >= len(self._all_items):
+            self._on_changed(None)   # all selected = no filter
+        else:
+            self._on_changed(set(self._checked))
 
 
 # ---------------------------------------------------------------------------

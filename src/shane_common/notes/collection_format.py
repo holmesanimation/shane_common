@@ -72,6 +72,16 @@ def format_note_contents(note: NoteRow) -> str:
     lines.append("")
     lines.append("--- NOTE TEXT ---")
     lines.append(note.text or "(empty)")
+    tagged_verses = note.context.get("tagged_verses", [])
+    tags = note.context.get("tags", [])
+    if tagged_verses:
+        lines.append("")
+        lines.append("--- TAGGED VERSES ---")
+        lines.append(", ".join(v.get("display", v.get("key", "")) for v in tagged_verses))
+    if tags:
+        lines.append("")
+        lines.append("--- TAGS ---")
+        lines.append(", ".join(f"#{t}" for t in tags))
     return "\n".join(lines)
 
 

@@ -36,6 +36,7 @@ from shane_common.notes.notes_writer import (
     make_note_id,
     make_revision_id,
 )
+from shane_common.ui.spellcheck_highlighter import enable_spellcheck
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +107,7 @@ class NoteDialog(QtWidgets.QDialog):
         self._body_edit.setPlaceholderText("Enter note text\u2026")
         self._body_edit.setMinimumHeight(120)
         layout.addWidget(self._body_edit)
+        enable_spellcheck(self._body_edit)
 
         # ---- Commit + Open folder buttons ----
         btn_row = QtWidgets.QHBoxLayout()
@@ -245,6 +247,7 @@ class _NoteCard(QtWidgets.QFrame):
         self._body_editor.setMaximumHeight(100)
         self._body_editor.setVisible(False)
         layout.addWidget(self._body_editor)
+        enable_spellcheck(self._body_editor)
 
         # Buttons
         btn_row = QtWidgets.QHBoxLayout()

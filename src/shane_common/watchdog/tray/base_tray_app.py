@@ -253,7 +253,12 @@ class BaseTrayApp(QtCore.QObject):
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as fh:
                     fh.write(payload)
-                os.replace(tmp, self._liveness_path)
+                try:
+                    os.replace(tmp, self._liveness_path)
+                except PermissionError:
+                    # Windows: destination held open by another process (e.g. supervisor
+                    # reading the file).  Skip this tick — next write will succeed.
+                    pass
             finally:
                 try:
                     if os.path.exists(tmp):

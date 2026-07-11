@@ -1,6 +1,7 @@
 """load_json_file, save_json_file_atomic – thin helpers over atomic writes."""
 
 import json
+import traceback
 from pathlib import Path
 
 from .atomic import write_json_atomic
@@ -19,6 +20,7 @@ def load_json_file(path, default=None):
         with p.open("r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
+        traceback.print_exc()
         return default
 
 

@@ -86,7 +86,9 @@ class _TeeWriter:
             if text:
                 for line in text.split("\n"):
                     stripped = line.rstrip("\r")
-                    if stripped:
+                    # Skip Python 3.11+ fine-grained error location lines
+                    # (lines consisting only of ^ and ~ characters).
+                    if stripped and not all(c in "^~ " for c in stripped):
                         ConsoleCapture._append(stripped, kind)
         except Exception:
             pass
@@ -331,6 +333,10 @@ class ConsoleCapture:
                 if cls._csv_writer is None:
                     return
                 cls._csv_writer.writerow([ts_iso, level, line])
-                cls._csv_file.flush()
+                # File is opened with buffering=1 (line-buffered); the OS will
+                # flush at newlines automatically.  An explicit flush() here
+                # causes a syscall on every log line and, when logging is
+                # high-frequency (e.g. IB error storms), holds _csv_lock long
+                # enough to block the asyncio thread for > 1 s.
         except Exception:
             pass

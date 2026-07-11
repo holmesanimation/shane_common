@@ -1,0 +1,29 @@
+#!/bin/sh
+
+DEVLOG="docs/devlog/current.md"
+
+cat > "$DEVLOG" <<'EOF'
+# Current Development Log
+
+## YYYY-MM-DD — Short title
+
+### Problem
+...
+
+### Cause
+...
+
+### Solution
+...
+
+### Files touched
+- `...`
+
+### Verification
+- `...`
+
+### Follow-ups
+- ...
+EOF
+
+echo "Reset docs/devlog/current.md for the next change."
