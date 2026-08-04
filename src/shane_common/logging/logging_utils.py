@@ -39,6 +39,16 @@ class AlignedFormatter(logging.Formatter):
         return super().format(record)
 
 
+class _LiveStdoutProxy:
+    """Delegates writes to whatever sys.stdout currently is, not a cached reference."""
+
+    def write(self, data: str) -> int:
+        return sys.stdout.write(data)
+
+    def flush(self) -> None:
+        sys.stdout.flush()
+
+
 class JournalingContextFilter(logging.Filter):
     """
     Inject correlation fields from JournalingContext into every LogRecord.
@@ -95,7 +105,7 @@ def get_logger(class_or_name: Any = None) -> logging.Logger:
     logger = logging.getLogger(class_or_name)
 
     if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
+        handler = logging.StreamHandler(_LiveStdoutProxy())
         handler.addFilter(JournalingContextFilter())
         handler.setFormatter(
             AlignedFormatter(
@@ -103,7 +113,6 @@ def get_logger(class_or_name: Any = None) -> logging.Logger:
                 datefmt="%Y-%m-%d %H:%M:%S",
             )
         )
-        handler.setStream(sys.stdout)
 
         try:
             if hasattr(sys.stdout, "reconfigure"):

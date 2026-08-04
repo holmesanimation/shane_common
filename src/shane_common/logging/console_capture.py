@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import csv
 import glob
+import logging
 import os
 import re
 import shutil
@@ -101,10 +102,29 @@ class _TeeWriter:
             original.flush()
         except Exception:
             pass
+        try:
+            ConsoleCapture._flush_csv()
+        except Exception:
+            pass
 
     def __getattr__(self, name: str):
         original = object.__getattribute__(self, "_original")
         return getattr(original, name)
+
+
+class _ConsoleCsvLogHandler(logging.Handler):
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+        except Exception:
+            try:
+                message = record.getMessage()
+            except Exception:
+                return
+        ConsoleCapture._append(
+            message,
+            _STDERR_KIND if record.levelno >= logging.ERROR else _STDOUT_KIND,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -122,13 +142,20 @@ class ConsoleCapture:
     _lock: threading.Lock = threading.Lock()
     _active: bool = False
 
-    _csv_lock: threading.Lock = threading.Lock()
+    # RLock (not Lock): relocate() holds this lock for its whole body, and on a
+    # failed move it writes a warning via sys.stderr, which is tee'd through
+    # _TeeWriter back into _append() on the same thread — that reentrant
+    # _csv_lock acquisition would self-deadlock forever with a plain Lock.
+    _csv_lock: threading.RLock = threading.RLock()
     _csv_file = None
     _csv_writer = None
     _csv_path: Optional[str] = None
 
     _orig_stdout: Optional[IO] = None
     _orig_stderr: Optional[IO] = None
+    _logging_handler: Optional[logging.Handler] = None
+    _pending_rows: int = 0
+    _last_flush_monotonic: float = 0.0
 
     # ------------------------------------------------------------------
     # Public API
@@ -182,6 +209,8 @@ class ConsoleCapture:
                 cls._csv_file = f
                 cls._csv_writer = writer
                 cls._csv_path = csv_path
+                cls._pending_rows = 0
+                cls._last_flush_monotonic = time.perf_counter()
 
             cls._orig_stdout = sys.stdout
             cls._orig_stderr = sys.stderr
@@ -189,6 +218,7 @@ class ConsoleCapture:
             sys.stdout = _TeeWriter(cls._orig_stdout, _STDOUT_KIND)
             sys.stderr = _TeeWriter(cls._orig_stderr, _STDERR_KIND)
 
+            cls._install_logging_bridge()
             cls._active = True
 
     @classmethod
@@ -210,6 +240,7 @@ class ConsoleCapture:
             cls._orig_stdout = None
             cls._orig_stderr = None
             cls._active = False
+            cls._remove_logging_bridge()
 
         with cls._csv_lock:
             if cls._csv_file is not None:
@@ -221,6 +252,7 @@ class ConsoleCapture:
                 cls._csv_file = None
                 cls._csv_writer = None
                 cls._csv_path = None
+                cls._pending_rows = 0
 
     @classmethod
     def relocate(
@@ -266,9 +298,19 @@ class ConsoleCapture:
             cls._csv_file = None
             cls._csv_writer = None
 
+            # Copy (not rename) the old file into place: renaming needs exclusive
+            # delete access, which a transient AV/indexer lock can block for
+            # seconds, but a plain read-only copy succeeds even while locked.
             try:
                 os.makedirs(new_dir, exist_ok=True)
-                shutil.move(old_path, new_path)
+                shutil.copyfile(old_path, new_path)
+                for attempt in range(5):
+                    try:
+                        os.remove(old_path)
+                        break
+                    except Exception:
+                        if attempt < 4:
+                            time.sleep(0.2)
             except Exception as exc:
                 try:
                     sys.stderr.write(
@@ -284,6 +326,8 @@ class ConsoleCapture:
                 cls._csv_file = f
                 cls._csv_writer = csv.writer(f)
                 cls._csv_path = new_path
+                cls._pending_rows = 0
+                cls._last_flush_monotonic = time.perf_counter()
             except Exception as exc:
                 try:
                     sys.stderr.write(
@@ -312,6 +356,43 @@ class ConsoleCapture:
         """Absolute path of the current CSV file, or ``None`` if inactive."""
         return self.__class__._csv_path
 
+    @classmethod
+    def _install_logging_bridge(cls) -> None:
+        if cls._logging_handler is not None:
+            return
+        try:
+            handler = _ConsoleCsvLogHandler(level=logging.NOTSET)
+            handler.setFormatter(logging.Formatter("%(name)s %(message)s"))
+            logger = logging.getLogger("TradeApp")
+            logger.addHandler(handler)
+            # Most "TradeApp.*" child loggers throughout the app (e.g.
+            # SimulationRunner, ReplayController) are created via a plain
+            # logging.getLogger(...) call and never call setLevel(), so their
+            # *effective* level resolves up the ancestor chain to the root
+            # logger's default of WARNING. That silently drops every
+            # info()/debug() call before a LogRecord is even created — this
+            # handler on "TradeApp" would never see them, no matter how the
+            # handler itself is configured. Set an explicit floor here so
+            # descendants that don't set their own level inherit INFO instead
+            # of the interpreter default. Do not override a level a caller
+            # may have already configured on this logger.
+            if logger.level == logging.NOTSET:
+                logger.setLevel(logging.INFO)
+            cls._logging_handler = handler
+        except Exception:
+            cls._logging_handler = None
+
+    @classmethod
+    def _remove_logging_bridge(cls) -> None:
+        handler = cls._logging_handler
+        if handler is None:
+            return
+        try:
+            logging.getLogger("TradeApp").removeHandler(handler)
+        except Exception:
+            pass
+        cls._logging_handler = None
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
@@ -333,10 +414,25 @@ class ConsoleCapture:
                 if cls._csv_writer is None:
                     return
                 cls._csv_writer.writerow([ts_iso, level, line])
-                # File is opened with buffering=1 (line-buffered); the OS will
-                # flush at newlines automatically.  An explicit flush() here
-                # causes a syscall on every log line and, when logging is
-                # high-frequency (e.g. IB error storms), holds _csv_lock long
-                # enough to block the asyncio thread for > 1 s.
+                cls._pending_rows += 1
+                _now = time.perf_counter()
+                if cls._pending_rows >= 25 or (_now - cls._last_flush_monotonic) >= 1.0:
+                    cls._flush_csv_locked(now_monotonic=_now)
         except Exception:
             pass
+
+    @classmethod
+    def _flush_csv(cls) -> None:
+        with cls._csv_lock:
+            cls._flush_csv_locked(now_monotonic=time.perf_counter())
+
+    @classmethod
+    def _flush_csv_locked(cls, *, now_monotonic: float) -> None:
+        if cls._csv_file is None:
+            return
+        try:
+            cls._csv_file.flush()
+        except Exception:
+            return
+        cls._pending_rows = 0
+        cls._last_flush_monotonic = now_monotonic
