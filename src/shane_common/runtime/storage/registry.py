@@ -143,6 +143,18 @@ class StorageRegistry:
             )
         return location.local_path
 
+    def required_parameters(self, resource_id: str) -> tuple[str, ...]:
+        """Return the authoritative, sorted template parameter names for a resource."""
+
+        try:
+            registration = self._resources[resource_id]
+        except KeyError as exc:
+            raise UnknownStorageResourceError(
+                f"Unknown storage resource {resource_id!r}"
+            ) from exc
+
+        return tuple(sorted(_template_fields(registration.path_template)))
+
 
 def _validate_path_template(template: str) -> None:
     if "\x00" in template:

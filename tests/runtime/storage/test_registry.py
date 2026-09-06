@@ -191,6 +191,55 @@ def test_resolution_does_not_create_directories(tmp_path: Path) -> None:
     assert not target.exists()
 
 
+def test_required_parameters_returns_empty_for_parameter_free_resource(tmp_path: Path) -> None:
+    resource = StorageResourceRegistration(
+        resource_id="logs.system",
+        profile_id="system",
+        path_template="logs",
+    )
+    registry = StorageRegistry(profiles=_profiles(tmp_path), resources=(resource,))
+
+    assert registry.required_parameters("logs.system") == ()
+
+
+def test_required_parameters_returns_sorted_names(tmp_path: Path) -> None:
+    resource = StorageResourceRegistration(
+        resource_id="marketdata.bars",
+        profile_id="local_data",
+        path_template="marketdata/bars/{timeframe}/{instrument}/{provider}",
+    )
+    registry = StorageRegistry(profiles=_profiles(tmp_path), resources=(resource,))
+
+    assert registry.required_parameters("marketdata.bars") == (
+        "instrument",
+        "provider",
+        "timeframe",
+    )
+
+
+def test_required_parameters_unknown_resource_follows_resolve_error_convention(
+    tmp_path: Path,
+) -> None:
+    registry = StorageRegistry(profiles=_profiles(tmp_path), resources=())
+
+    with pytest.raises(UnknownStorageResourceError, match="Unknown storage resource"):
+        registry.required_parameters("missing")
+
+
+def test_required_parameters_performs_no_filesystem_access(tmp_path: Path) -> None:
+    data_root = tmp_path / "data"
+    resource = StorageResourceRegistration(
+        resource_id="logs.system",
+        profile_id="local_data",
+        path_template="logs",
+    )
+    registry = StorageRegistry(profiles=_profiles(tmp_path), resources=(resource,))
+
+    registry.required_parameters("logs.system")
+
+    assert not data_root.exists()
+
+
 def test_list_and_get_are_stable(tmp_path: Path) -> None:
     resources = (
         StorageResourceRegistration(
