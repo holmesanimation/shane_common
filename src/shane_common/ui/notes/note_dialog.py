@@ -69,6 +69,8 @@ class NoteDialog(QtWidgets.QDialog):
         context: dict | None = None,
         instrument: str | None = None,
         strategy_id: str | None = None,
+        show_type_selector: bool = True,
+        history_rows: list[Any] | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
@@ -77,6 +79,8 @@ class NoteDialog(QtWidgets.QDialog):
         self._context = dict(context or {})
         self._instrument = instrument
         self._strategy_id = strategy_id
+        self._show_type_selector = show_type_selector
+        self._history_rows = list(history_rows) if history_rows is not None else None
         self._last_path: Path | None = None
 
         self.setWindowTitle("Add Note")
@@ -91,15 +95,17 @@ class NoteDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(8)
 
-        # ---- Type row ----
-        type_row = QtWidgets.QHBoxLayout()
-        type_row.addWidget(QtWidgets.QLabel("Type:"))
-        self._type_combo = QtWidgets.QComboBox()
-        for nt in NoteType:
-            self._type_combo.addItem(nt.value.title(), nt)
-        type_row.addWidget(self._type_combo)
-        type_row.addStretch()
-        layout.addLayout(type_row)
+        # ---- Type row (omitted when the owner implies a fixed note type) ----
+        self._type_combo: QtWidgets.QComboBox | None = None
+        if self._show_type_selector:
+            type_row = QtWidgets.QHBoxLayout()
+            type_row.addWidget(QtWidgets.QLabel("Type:"))
+            self._type_combo = QtWidgets.QComboBox()
+            for nt in NoteType:
+                self._type_combo.addItem(nt.value.title(), nt)
+            type_row.addWidget(self._type_combo)
+            type_row.addStretch()
+            layout.addLayout(type_row)
 
         # ---- Body ----
         layout.addWidget(QtWidgets.QLabel("Note:"))
@@ -126,10 +132,34 @@ class NoteDialog(QtWidgets.QDialog):
         btn_row.addStretch()
         layout.addLayout(btn_row)
 
+        # ---- Prior notes history (optional) ----
+        self._history_list: QtWidgets.QListWidget | None = None
+        if self._history_rows is not None:
+            layout.addWidget(QtWidgets.QLabel("Previous Notes"))
+            self._history_list = QtWidgets.QListWidget()
+            self._history_list.setSpacing(2)
+            self._history_list.setMaximumHeight(140)
+            layout.addWidget(self._history_list)
+            self._populate_history()
+
         # ---- Status ----
         self._status_label = QtWidgets.QLabel("")
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
+
+    def _populate_history(self) -> None:
+        if self._history_list is None or self._history_rows is None:
+            return
+        self._history_list.clear()
+        rows = sorted(self._history_rows, key=lambda r: getattr(r, "ts", 0) or 0, reverse=True)
+        for row in rows:
+            self._history_list.addItem(self._format_history_item(getattr(row, "wall_ts", None), getattr(row, "text", "")))
+
+    @staticmethod
+    def _format_history_item(wall_ts: float | None, text: str) -> str:
+        ts_label = datetime.fromtimestamp(wall_ts).strftime("%b %d %H:%M") if wall_ts else ""
+        preview = (text or "")[:80]
+        return f"[{ts_label}] {preview}"
 
     # ------------------------------------------------------------------
     # Slots
@@ -142,7 +172,7 @@ class NoteDialog(QtWidgets.QDialog):
             self._status_label.setText("Note text is empty.")
             return
 
-        note_type: NoteType = self._type_combo.currentData()
+        note_type: NoteType = self._type_combo.currentData() if self._type_combo is not None else NoteType.GENERAL
         ts = float(self._writer._app_clock.now_ts) if self._writer._app_clock is not None else time.time()
         note = Note(
             ts=ts,
@@ -160,6 +190,8 @@ class NoteDialog(QtWidgets.QDialog):
             self._open_folder_btn.setEnabled(True)
             self._status_label.setText(f"Saved to {path}")
             self._body_edit.clear()
+            if self._history_list is not None:
+                self._history_list.insertItem(0, self._format_history_item(note.wall_ts, note.text))
         except Exception as exc:
             traceback.print_exc()
             self._status_label.setText(f"Error: {exc}")

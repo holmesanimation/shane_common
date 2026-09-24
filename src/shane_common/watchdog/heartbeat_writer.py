@@ -24,8 +24,13 @@ from typing import Callable, Optional
 log = logging.getLogger(__name__)
 
 _DEFAULT_PERIOD_S: float = 2.0
-_REPLACE_RETRIES: int = 5
-_REPLACE_DELAY_S: float = 0.05
+# Windows os.replace() can hit transient WinError 5 (Access is denied) under
+# external file-lock contention (AV real-time scanning, cloud-sync agents,
+# concurrent readers in the same shared heartbeats_dir). 30 x 100ms = 3s
+# budget, comfortably above single-digit-second lock hold times observed
+# across apps sharing this directory.
+_REPLACE_RETRIES: int = 30
+_REPLACE_DELAY_S: float = 0.1
 
 
 # ---------------------------------------------------------------------------

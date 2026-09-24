@@ -46,10 +46,9 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
         language: str = "en",
         ignored_words: Iterable[str] | None = None,
     ) -> None:
-        super().__init__(document)
-
         # Import lazily so the rest of shane_common still loads without
-        # pyspellchecker when the `qt` extra is not installed.
+        # pyspellchecker when the `qt` extra is not installed, and before
+        # attaching the document (which triggers an immediate highlightBlock).
         from spellchecker import SpellChecker  # type: ignore[import]
 
         self._spell = SpellChecker(language=language)
@@ -58,6 +57,9 @@ class SpellCheckHighlighter(QSyntaxHighlighter):
         self._fmt = QTextCharFormat()
         self._fmt.setUnderlineColor(QColor("red"))
         self._fmt.setUnderlineStyle(QTextCharFormat.UnderlineStyle.SpellCheckUnderline)
+
+        # PySide6's QSyntaxHighlighter requires the document argument here.
+        super().__init__(document)
 
     # ------------------------------------------------------------------
     # Public helpers
