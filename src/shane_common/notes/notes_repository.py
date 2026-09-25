@@ -75,6 +75,43 @@ class NoteRow:
 
 
 # ---------------------------------------------------------------------------
+# Revision helpers (v1 rows carry note_id/revision_num inside ``context``)
+# ---------------------------------------------------------------------------
+
+def effective_note_id(row: NoteRow) -> str | None:
+    """Return the row's ``note_id`` (v2) or ``context["note_id"]`` (v1)."""
+    return row.note_id or (row.context or {}).get("note_id") or None
+
+
+def effective_revision_num(row: NoteRow) -> int:
+    """Return the row's revision number, defaulting to 1."""
+    raw = row.revision_num or (row.context or {}).get("revision_num") or 1
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return 1
+
+
+def latest_revisions(rows: list[NoteRow]) -> list[NoteRow]:
+    """Collapse *rows* to the latest revision per note, newest ``ts`` first.
+
+    Rows without a note ID pass through unchanged (one per row).
+    """
+    best: dict[str, NoteRow] = {}
+    loose: list[NoteRow] = []
+    for r in rows:
+        nid = effective_note_id(r)
+        if nid is None:
+            loose.append(r)
+            continue
+        cur = best.get(nid)
+        if cur is None or effective_revision_num(r) >= effective_revision_num(cur):
+            best[nid] = r
+    result = loose + list(best.values())
+    return sorted(result, key=lambda r: getattr(r, "ts", 0) or 0, reverse=True)
+
+
+# ---------------------------------------------------------------------------
 # Internal parsing
 # ---------------------------------------------------------------------------
 

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone as _tz
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,12 @@ from shane_common.notes.notes_writer import (
     NotesWriter,
     make_note_id,
     make_revision_id,
+)
+from shane_common.notes.notes_repository import (
+    NoteRow,
+    effective_note_id,
+    effective_revision_num,
+    latest_revisions,
 )
 from shane_common.ui.spellcheck_highlighter import enable_spellcheck
 
@@ -95,6 +102,8 @@ class NoteDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(8)
 
+        self._build_top_extra(layout)
+
         # ---- Type row (omitted when the owner implies a fixed note type) ----
         self._type_combo: QtWidgets.QComboBox | None = None
         if self._show_type_selector:
@@ -130,6 +139,7 @@ class NoteDialog(QtWidgets.QDialog):
         self._open_folder_btn.clicked.connect(self._on_open_folder)
         btn_row.addWidget(self._open_folder_btn)
         btn_row.addStretch()
+        self._build_commit_row_extra(btn_row)
         layout.addLayout(btn_row)
 
         # ---- Prior notes history (optional) ----
@@ -139,6 +149,9 @@ class NoteDialog(QtWidgets.QDialog):
             self._history_list = QtWidgets.QListWidget()
             self._history_list.setSpacing(2)
             self._history_list.setMaximumHeight(140)
+            self._history_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            self._history_list.customContextMenuRequested.connect(self._on_history_context_menu)
+            self._history_list.setProperty("ownContextMenu", True)
             layout.addWidget(self._history_list)
             self._populate_history()
 
@@ -147,13 +160,98 @@ class NoteDialog(QtWidgets.QDialog):
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
 
+    # ------------------------------------------------------------------
+    # Subclass hooks (default no-ops)
+    # ------------------------------------------------------------------
+
+    def _build_top_extra(self, layout: QtWidgets.QVBoxLayout) -> None:
+        """Insert extra widgets above the Type row."""
+
+    def _build_commit_row_extra(self, btn_row: QtWidgets.QHBoxLayout) -> None:
+        """Append right-anchored widgets to the Commit row."""
+
+    def _history_item_rich_text(self, row: Any) -> str | None:
+        """Return HTML for a history row, or ``None`` for plain-text rendering."""
+        return None
+
+    def _extra_edit_widget_factory(self) -> QtWidgets.QWidget | None:
+        return None
+
+    def _extra_edit_widget_set_value(self, widget: QtWidgets.QWidget, row: Any) -> None:
+        pass
+
+    def _extra_edit_widget_get_context(self, widget: QtWidgets.QWidget) -> dict:
+        return {}
+
+    def _on_note_edited(self, row: Any, new_text: str, new_context: dict) -> None:
+        pass
+
+    # ------------------------------------------------------------------
+    # History list
+    # ------------------------------------------------------------------
+
     def _populate_history(self) -> None:
         if self._history_list is None or self._history_rows is None:
             return
         self._history_list.clear()
-        rows = sorted(self._history_rows, key=lambda r: getattr(r, "ts", 0) or 0, reverse=True)
-        for row in rows:
-            self._history_list.addItem(self._format_history_item(getattr(row, "wall_ts", None), getattr(row, "text", "")))
+        for row in latest_revisions(self._history_rows):
+            self._add_history_item(row)
+
+    def _add_history_item(self, row: Any) -> None:
+        if self._history_list is None:
+            return
+        html = self._history_item_rich_text(row)
+        text = "" if html is not None else self._format_history_item(
+            getattr(row, "wall_ts", None), getattr(row, "text", "")
+        )
+        item = QtWidgets.QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, row)
+        self._history_list.addItem(item)
+        if html is not None:
+            label = QtWidgets.QLabel(html)
+            label.setTextFormat(Qt.TextFormat.RichText)
+            label.setWordWrap(True)
+            item.setSizeHint(label.sizeHint())
+            self._history_list.setItemWidget(item, label)
+
+    def _on_history_context_menu(self, pos: QtCore.QPoint) -> None:
+        if self._history_list is None:
+            return
+        item = self._history_list.itemAt(pos)
+        if item is None:
+            return
+        row = item.data(Qt.ItemDataRole.UserRole)
+        if row is None:
+            return
+        menu = QtWidgets.QMenu(self._history_list)
+        edit_action = menu.addAction("Edit Note")
+        chosen = menu.exec(self._history_list.viewport().mapToGlobal(pos))
+        if chosen is not edit_action:
+            return
+        if effective_note_id(row) is None:
+            QtWidgets.QMessageBox.information(
+                self, "Cannot Edit", "This note predates versioning and cannot be edited."
+            )
+            return
+        _EditNoteDialog(self, row).exec()
+
+    def _record_new_revision(self, note: Note) -> None:
+        """Add a just-committed note to the history cache and re-render."""
+        if self._history_rows is None:
+            return
+        self._history_rows.append(NoteRow(
+            schema_version=1,
+            raw={},
+            ts=note.ts,
+            wall_ts=note.wall_ts,
+            note_type=str(note.note_type),
+            text=note.text,
+            instrument=note.instrument,
+            strategy_id=note.strategy_id,
+            context=dict(note.context),
+            owner=note.owner,
+        ))
+        self._populate_history()
 
     @staticmethod
     def _format_history_item(wall_ts: float | None, text: str) -> str:
@@ -174,6 +272,10 @@ class NoteDialog(QtWidgets.QDialog):
 
         note_type: NoteType = self._type_combo.currentData() if self._type_combo is not None else NoteType.GENERAL
         ts = float(self._writer._app_clock.now_ts) if self._writer._app_clock is not None else time.time()
+        context = dict(self._context)
+        context.setdefault("note_id", uuid.uuid4().hex)
+        context["revision_num"] = 1
+        context["op"] = "create"
         note = Note(
             ts=ts,
             wall_ts=time.time(),
@@ -182,7 +284,7 @@ class NoteDialog(QtWidgets.QDialog):
             text=text,
             instrument=self._instrument,
             strategy_id=self._strategy_id,
-            context=dict(self._context),
+            context=context,
         )
         try:
             path = self._writer.commit(note)
@@ -190,8 +292,7 @@ class NoteDialog(QtWidgets.QDialog):
             self._open_folder_btn.setEnabled(True)
             self._status_label.setText(f"Saved to {path}")
             self._body_edit.clear()
-            if self._history_list is not None:
-                self._history_list.insertItem(0, self._format_history_item(note.wall_ts, note.text))
+            self._record_new_revision(note)
         except Exception as exc:
             traceback.print_exc()
             self._status_label.setText(f"Error: {exc}")
@@ -219,6 +320,86 @@ class NoteDialog(QtWidgets.QDialog):
         if strategy_id is not None:
             self._strategy_id = strategy_id
         self._status_label.setText("")
+
+
+# ---------------------------------------------------------------------------
+# _EditNoteDialog — append a new revision of an existing NoteDialog note
+# ---------------------------------------------------------------------------
+
+class _EditNoteDialog(QtWidgets.QDialog):
+    """Modal editor that commits a new revision line (same ``note_id``)."""
+
+    def __init__(self, parent_dialog: NoteDialog, row: Any) -> None:
+        super().__init__(parent_dialog)
+        self._parent_dialog = parent_dialog
+        self._row = row
+        self.setWindowTitle("Edit Note")
+        self.setMinimumWidth(460)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+        layout.addWidget(QtWidgets.QLabel("Note:"))
+        self._body_edit = QtWidgets.QPlainTextEdit()
+        self._body_edit.setPlainText(getattr(row, "text", "") or "")
+        self._body_edit.setMinimumHeight(120)
+        layout.addWidget(self._body_edit)
+        enable_spellcheck(self._body_edit)
+
+        self._extra_widget = parent_dialog._extra_edit_widget_factory()
+        if self._extra_widget is not None:
+            parent_dialog._extra_edit_widget_set_value(self._extra_widget, row)
+            layout.addWidget(self._extra_widget)
+
+        btn_row = QtWidgets.QHBoxLayout()
+        commit_btn = QtWidgets.QPushButton("Commit")
+        commit_btn.setDefault(True)
+        commit_btn.clicked.connect(self._on_commit)
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        btn_row.addWidget(commit_btn)
+        btn_row.addWidget(cancel_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self._status_label = QtWidgets.QLabel("")
+        self._status_label.setWordWrap(True)
+        layout.addWidget(self._status_label)
+
+    @QtCore.Slot()
+    def _on_commit(self) -> None:
+        new_text = self._body_edit.toPlainText().strip()
+        if not new_text:
+            self._status_label.setText("Note text is empty.")
+            return
+        parent = self._parent_dialog
+        row = self._row
+        try:
+            extra = (
+                parent._extra_edit_widget_get_context(self._extra_widget)
+                if self._extra_widget is not None else {}
+            )
+            new_context = {**(row.context or {}), **extra}
+            new_context["revision_num"] = effective_revision_num(row) + 1
+            new_context["op"] = "edit"
+            try:
+                note_type = NoteType(row.note_type) if row.note_type else NoteType.GENERAL
+            except ValueError:
+                note_type = NoteType.GENERAL
+            note = parent._writer.build_note(
+                note_type=note_type,
+                text=new_text,
+                instrument=getattr(row, "instrument", None),
+                strategy_id=getattr(row, "strategy_id", None),
+                context=new_context,
+            )
+            parent._writer.commit(note)
+        except Exception as exc:
+            traceback.print_exc()
+            self._status_label.setText(f"Error: {exc}")
+            return
+        parent._record_new_revision(note)
+        parent._on_note_edited(row, new_text, new_context)
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
