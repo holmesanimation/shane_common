@@ -1,1 +1,1 @@
-"""shane_common.notes — append-only notes storage and browsing."""
+"""shane_common.notes — SQLite-backed, append-only notes storage and browsing."""

@@ -2,12 +2,15 @@
 """Notes Browser — standalone window for browsing, collecting, and correlating
 notes across all owners.
 
-Layout (three splitter columns):
-    Left   — owner list
-    Middle — notes table for selected owner
-    Right  — detail panel split into Contents (top) and Collection (bottom)
+Layout (four splitter columns):
+    Owners   — owner list, "New Owner"
+    Subjects — ALL / UNSET / subjects for the selected owner, "New Subject"
+    Middle   — notes table for the selected owner and subject
+    Right    — detail panel split into Contents (top) and Collection (bottom)
 
-Read-only browsing.  All writes go through NotesWriter, never this window.
+Browsing reads through the repository.  Edits, deletes and new owners/subjects
+are appended through ``NotesWriter`` / ``NotesRegistry`` — earlier revisions of
+a note are never rewritten.
 
 Requires: shane_common[qt]  (PySide6>=6.5)
 """
@@ -21,11 +24,20 @@ from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt
 
 from shane_common.notes.notes_repository import NoteRow, NotesRepository
+from shane_common.notes.notes_writer import OP_DELETE, UNSET_SUBJECT
+from shane_common.notes.registry import (
+    ALL_SUBJECTS_LABEL,
+    NotesRegistry,
+    get_default_registry,
+)
+from shane_common.notes.revisions import commit_revision
 from shane_common.notes.collection_format import (
     build_collection_entry,
     build_collection_manifest_header,
     format_note_contents,
 )
+from shane_common.ui.notes.note_dialog import EditNoteDialog
+from shane_common.ui.notes.subject_picker import NewOwnerDialog, NewSubjectDialog
 
 # ---------------------------------------------------------------------------
 # Middle-table columns
@@ -38,6 +50,11 @@ _M_NUM_BASE_COLS = 4
 
 _UNTAGGED_SENTINEL = "(untagged)"
 
+# Subject-list filter values.  Real subjects use their registry id; UNSET is the
+# stored value for notes without a subject.  ALL is list-only (never stored).
+_FILTER_ALL = "\0all"
+_FILTER_UNSET = UNSET_SUBJECT
+
 
 class NotesBrowserWindow(QtWidgets.QMainWindow):
     """Notes Browser window.
@@ -46,6 +63,10 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
     ----------
     repository:
         ``NotesRepository`` instance used for discovery and lookups.
+    registry:
+        ``NotesRegistry`` of owners and subjects.  Defaults to the
+        application-wide registry; without one the owner/subject creation
+        buttons are disabled and subjects show by raw id.
     parent:
         Optional Qt parent widget.
     """
@@ -54,16 +75,20 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self,
         repository: NotesRepository,
         parent: QtWidgets.QWidget | None = None,
+        *,
+        registry: NotesRegistry | None = None,
     ) -> None:
         super().__init__(parent)
         self._repository = repository
+        self._registry = registry if registry is not None else get_default_registry()
 
         self._current_owner: str | None = None
+        self._current_subject: str = _FILTER_ALL
         self._owner_rows: list[NoteRow] = []
         self._visible_rows: list[NoteRow] = []
         self._active_tag_filter: set[str] | None = None
         self._lock_time_ts: float | None = None
-        self._writer: object | None = None
+        self._writer = None  # NotesWriter, injected via set_writer()
 
         self.setWindowTitle("Notes Browser")
         self.resize(1200, 700)
@@ -80,11 +105,21 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self._refresh_owners()
 
     def set_writer(self, writer: object) -> None:
-        """Inject a ``NotesWriter`` so correlation records can be persisted."""
+        """Inject a ``NotesWriter`` used to persist correlations, edits and deletes.
+
+        Edits and deletes are filed under the note's own owner via
+        ``writer.for_owner(...)``, so any writer sharing the desired store will do.
+        """
         self._writer = writer
 
+    def set_registry(self, registry: NotesRegistry | None) -> None:
+        """Replace the owner/subject registry."""
+        self._registry = registry
+        self._update_create_buttons()
+        self.refresh()
+
     def refresh(self) -> None:
-        """Re-read disk and refresh the current view."""
+        """Re-read the database and refresh the current view."""
         self._refresh_owners()
         if self._current_owner:
             self._load_owner(self._current_owner)
@@ -121,11 +156,38 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self._owner_list.currentItemChanged.connect(self._on_owner_selected)
         left_layout.addWidget(self._owner_list, stretch=1)
 
+        self._btn_new_owner = QtWidgets.QPushButton("New Owner", left_panel)
+        self._btn_new_owner.clicked.connect(self._on_new_owner)
+        left_layout.addWidget(self._btn_new_owner)
+
         btn_refresh = QtWidgets.QPushButton("Refresh", left_panel)
         btn_refresh.clicked.connect(self.refresh)
         left_layout.addWidget(btn_refresh)
 
         splitter.addWidget(left_panel)
+
+        # ----------------------------------------------------------------
+        # Subjects list (between owners and the notes table)
+        # ----------------------------------------------------------------
+        subjects_panel = QtWidgets.QWidget(splitter)
+        subjects_layout = QtWidgets.QVBoxLayout(subjects_panel)
+        subjects_layout.setContentsMargins(4, 4, 4, 4)
+        subjects_layout.setSpacing(4)
+
+        lbl_subjects = QtWidgets.QLabel("Subjects", subjects_panel)
+        lbl_subjects.setFont(f)
+        subjects_layout.addWidget(lbl_subjects)
+
+        self._subject_list = QtWidgets.QListWidget(subjects_panel)
+        self._subject_list.currentItemChanged.connect(self._on_subject_selected)
+        subjects_layout.addWidget(self._subject_list, stretch=1)
+
+        self._btn_new_subject = QtWidgets.QPushButton("New Subject", subjects_panel)
+        self._btn_new_subject.clicked.connect(self._on_new_subject)
+        subjects_layout.addWidget(self._btn_new_subject)
+
+        splitter.addWidget(subjects_panel)
+        self._update_create_buttons()
 
         # ----------------------------------------------------------------
         # Middle — notes table
@@ -156,7 +218,7 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self._btn_browse_folder.setIcon(
             self.style().standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DirOpenIcon)
         )
-        self._btn_browse_folder.setToolTip("Open notes folder in Explorer")
+        self._btn_browse_folder.setToolTip("Open the notes database folder in Explorer")
         self._btn_browse_folder.clicked.connect(self._on_browse_folder)
         top_bar.addWidget(self._btn_browse_folder)
 
@@ -180,6 +242,9 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         hdr.sectionClicked.connect(self._on_header_section_clicked)
         self._middle_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self._middle_table.customContextMenuRequested.connect(self._on_middle_context_menu)
+        # Tell the app-wide notes context-menu filter (Add Note / Browse Notes)
+        # to leave this widget's own menu alone.
+        self._middle_table.setProperty("ownContextMenu", True)
         self._middle_table.selectionModel().currentRowChanged.connect(self._on_middle_row_changed)
         middle_layout.addWidget(self._middle_table, stretch=1)
 
@@ -246,26 +311,48 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         right_splitter.setSizes([400, 250])
 
         splitter.addWidget(right_panel)
-        splitter.setSizes([180, 600, 420])
+        splitter.setSizes([160, 160, 520, 380])
 
         self._refresh_owners()
+
+    def _update_create_buttons(self) -> None:
+        enabled = self._registry is not None
+        tip = "" if enabled else "No owner/subject registry is configured."
+        for btn in (self._btn_new_owner, self._btn_new_subject):
+            btn.setEnabled(enabled)
+            btn.setToolTip(tip)
 
     # ------------------------------------------------------------------
     # Owner list
     # ------------------------------------------------------------------
 
-    def _refresh_owners(self) -> None:
+    def _stored_owner_keys(self) -> list[str]:
+        """Owner keys that have notes (also listed when no registry is configured)."""
         try:
-            owners = self._repository.list_owners()
+            return list(self._repository.list_owners())
         except Exception:
             traceback.print_exc()
-            owners = []
+            return []
+
+    def _owner_label(self, key: str) -> str:
+        return self._registry.owner_label(key) if self._registry is not None else key
+
+    def _subject_label(self, subject_id: str) -> str:
+        return self._registry.subject_label(subject_id) if self._registry is not None else subject_id
+
+    def _refresh_owners(self) -> None:
+        # Registry owners (built-in + user-created, even with no notes yet) plus
+        # any owner that has notes.
+        keys = {k: None for k in self._stored_owner_keys()}
+        if self._registry is not None:
+            keys.update({o.key: None for o in self._registry.owners()})
+        owners = sorted(keys, key=lambda k: self._owner_label(k).casefold())
 
         prev_key = self._current_owner
         self._owner_list.blockSignals(True)
         self._owner_list.clear()
         for key in owners:
-            item = QtWidgets.QListWidgetItem(key)
+            item = QtWidgets.QListWidgetItem(self._owner_label(key))
             item.setData(Qt.ItemDataRole.UserRole, key)
             self._owner_list.addItem(item)
         self._owner_list.blockSignals(False)
@@ -287,6 +374,7 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         if current is None:
             self._current_owner = None
             self._owner_rows = []
+            self._subject_list.clear()
             self._middle_table.setRowCount(0)
             self._contents_edit.clear()
             return
@@ -294,40 +382,82 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self._load_owner(key)
 
     # ------------------------------------------------------------------
+    # Subject list
+    # ------------------------------------------------------------------
+
+    def _refresh_subjects(self) -> None:
+        """Rebuild the subject list: ALL, UNSET, then the owner's subjects."""
+        owner = self._current_owner
+        entries: list[tuple[str, str]] = [
+            (ALL_SUBJECTS_LABEL, _FILTER_ALL),
+            (UNSET_SUBJECT, _FILTER_UNSET),
+        ]
+        if owner is not None and self._registry is not None:
+            for s in self._registry.subjects_for_owner(owner):
+                entries.append((s.label, s.id))
+
+        self._subject_list.blockSignals(True)
+        self._subject_list.clear()
+        for label, value in entries:
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(Qt.ItemDataRole.UserRole, value)
+            self._subject_list.addItem(item)
+        row = next(
+            (i for i, (_, value) in enumerate(entries) if value == self._current_subject), 0
+        )
+        self._current_subject = entries[row][1]
+        self._subject_list.setCurrentRow(row)
+        self._subject_list.blockSignals(False)
+
+    def _on_subject_selected(
+        self,
+        current: QtWidgets.QListWidgetItem | None,
+        previous: QtWidgets.QListWidgetItem | None,
+    ) -> None:
+        if current is None:
+            return
+        self._current_subject = current.data(Qt.ItemDataRole.UserRole)
+        self._rebuild_middle_table()
+
+    def _subject_rows(self) -> list[NoteRow]:
+        """Owner rows narrowed by the selected subject (before the tag filter)."""
+        if self._current_subject == _FILTER_ALL:
+            return list(self._owner_rows)
+        return [n for n in self._owner_rows if n.subject == self._current_subject]
+
+    # ------------------------------------------------------------------
     # Middle table
     # ------------------------------------------------------------------
 
     def _load_owner(self, owner_key: str) -> None:
+        if owner_key != self._current_owner:
+            self._current_subject = _FILTER_ALL
         self._current_owner = owner_key
-        self._lbl_middle_title.setText(owner_key)
+        self._lbl_middle_title.setText(self._owner_label(owner_key))
         self._active_tag_filter = None
         self._middle_table.horizontalHeaderItem(_M_COL_NOTE_TYPE).setText("Tags")
 
+        # Latest revision per note (deleted notes hidden), newest first.
         try:
-            all_rows = self._repository.rows_for_owner(owner_key)
+            self._owner_rows = self._repository.latest_notes_for_owner(
+                owner_key, newest_first=True
+            )
         except Exception:
             traceback.print_exc()
-            all_rows = []
-
-        by_note: dict[str, NoteRow] = {}
-        for r in all_rows:
-            key = r.note_id or r.revision_id or str(id(r))
-            existing = by_note.get(key)
-            if existing is None or (r.revision_num or 0) > (existing.revision_num or 0):
-                by_note[key] = r
-
-        self._owner_rows = sorted(by_note.values(), key=lambda r: r.ts or 0.0)
+            self._owner_rows = []
+        self._refresh_subjects()
         self._rebuild_middle_table()
 
         if self._btn_lock_time.isChecked() and self._lock_time_ts is not None:
             self._select_nearest_locked_row()
 
     def _rebuild_middle_table(self) -> None:
+        subject_rows = self._subject_rows()
         if self._active_tag_filter is None:
-            self._visible_rows = list(self._owner_rows)
+            self._visible_rows = subject_rows
         else:
             self._visible_rows = []
-            for note in self._owner_rows:
+            for note in subject_rows:
                 tags = note.context.get("tags", []) if isinstance(note.context, dict) else []
                 if tags:
                     if any(t in self._active_tag_filter for t in tags):
@@ -359,8 +489,9 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self._middle_table.setItem(row_idx, _M_COL_LOCAL_TS, _cell(local_str))
         self._middle_table.setItem(row_idx, _M_COL_UTC_TIME, _cell(utc_str))
         self._middle_table.setItem(row_idx, _M_COL_NOTE_TYPE, _cell(tags_str))
-        text_preview = (note.text or "").replace("\n", " ")[:80]
-        self._middle_table.setItem(row_idx, _M_COL_TEXT, _cell(text_preview))
+        # Title column: the note's title when it has one, else a preview of its text.
+        title = note.title or (note.text or "").replace("\n", " ")[:80]
+        self._middle_table.setItem(row_idx, _M_COL_TEXT, _cell(title))
 
     # ------------------------------------------------------------------
     # Lock Time
@@ -375,7 +506,7 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
         unique_tags: set[str] = set()
         has_untagged = False
-        for note in self._owner_rows:
+        for note in self._subject_rows():
             tags = note.context.get("tags", []) if isinstance(note.context, dict) else []
             if tags:
                 unique_tags.update(tags)
@@ -400,9 +531,9 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         self._rebuild_middle_table()
 
     def _on_browse_folder(self) -> None:
-        """Open the notes root directory in the OS file explorer."""
+        """Open the folder holding the notes database in the OS file explorer."""
         import subprocess
-        folder = self._repository._root
+        folder = self._repository.location
         folder.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(["explorer", str(folder)])
 
@@ -469,7 +600,9 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
             self._contents_edit.clear()
             return
         note = self._visible_rows[current_row]
-        self._contents_edit.setPlainText(format_note_contents(note))
+        self._contents_edit.setPlainText(
+            format_note_contents(note, subject_label=self._subject_label)
+        )
 
     # ------------------------------------------------------------------
     # Context menu
@@ -477,9 +610,23 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
 
     def _on_middle_context_menu(self, pos: QtCore.QPoint) -> None:
         row = self._middle_table.rowAt(pos.y())
-        if row < 0:
+        if row < 0 or row >= len(self._visible_rows):
             return
+        # Right-clicking outside the current selection acts on (and selects) that row.
+        if row not in {idx.row() for idx in self._middle_table.selectedIndexes()}:
+            self._middle_table.selectRow(row)
+        menu = self._build_row_menu(row)
+        menu.exec(self._middle_table.viewport().mapToGlobal(pos))
+
+    def _build_row_menu(self, row: int) -> QtWidgets.QMenu:
+        """Build the right-click menu for visible table row *row*."""
+        note = self._visible_rows[row]
         menu = QtWidgets.QMenu(self)
+        act_edit = menu.addAction("Edit Note")
+        act_edit.triggered.connect(lambda: self._on_edit_note(note))
+        act_delete = menu.addAction("Delete Note")
+        act_delete.triggered.connect(lambda: self._on_delete_note(note))
+        menu.addSeparator()
         act_copy = menu.addAction("Copy row")
         act_copy.triggered.connect(lambda: self._copy_middle_row(row))
 
@@ -488,8 +635,7 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
             menu.addSeparator()
             act_correlate = menu.addAction("Create Correlation\u2026")
             act_correlate.triggered.connect(lambda: self._on_create_correlation(selected_rows))
-
-        menu.exec(self._middle_table.viewport().mapToGlobal(pos))
+        return menu
 
     def _copy_middle_row(self, row_idx: int) -> None:
         if row_idx < 0 or row_idx >= len(self._owner_rows):
@@ -499,6 +645,89 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
             item = self._middle_table.item(row_idx, col)
             parts.append(item.text() if item else "")
         QtWidgets.QApplication.clipboard().setText("\t".join(parts))
+
+    # ------------------------------------------------------------------
+    # Edit / delete
+    # ------------------------------------------------------------------
+
+    def _writer_for(self, note: NoteRow):
+        """Return a writer bound to *note*'s owner, or ``None`` (after telling the user)."""
+        if self._writer is None:
+            QtWidgets.QMessageBox.information(
+                self, "Notes Browser", "No notes writer is available, so notes cannot be changed."
+            )
+            return None
+        return self._writer.for_owner(note.owner_key or self._current_owner or "")
+
+    def _on_edit_note(self, note: NoteRow) -> None:
+        writer = self._writer_for(note)
+        if writer is None:
+            return
+        dlg = EditNoteDialog(note, writer, registry=self._registry, parent=self)
+        if dlg.exec() == QtWidgets.QDialog.DialogCode.Accepted:
+            self.refresh()
+
+    def _on_delete_note(self, note: NoteRow) -> None:
+        writer = self._writer_for(note)
+        if writer is None:
+            return
+        preview = note.title or (note.text or "").replace("\n", " ")[:80]
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Delete Note",
+            f"Delete this note?\n\n{preview}\n\n"
+            "It is removed from the browser; the note's history stays in the notes database.",
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No,
+            QtWidgets.QMessageBox.StandardButton.No,
+        )
+        if answer != QtWidgets.QMessageBox.StandardButton.Yes:
+            return
+        try:
+            commit_revision(
+                writer,
+                note,
+                op=OP_DELETE,
+                text=note.text,
+                title=note.title,
+                subject=note.subject,
+            )
+        except Exception as exc:
+            traceback.print_exc()
+            QtWidgets.QMessageBox.critical(self, "Delete Note", f"Could not delete the note:\n{exc}")
+            return
+        self.refresh()
+
+    # ------------------------------------------------------------------
+    # New owner / new subject
+    # ------------------------------------------------------------------
+
+    def _on_new_owner(self) -> None:
+        if self._registry is None:
+            return
+        dlg = NewOwnerDialog(self._registry, reserved_keys=self._stored_owner_keys(), parent=self)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted or dlg.created is None:
+            return
+        self._current_owner = dlg.created.key
+        self._current_subject = _FILTER_ALL
+        self.refresh()
+
+    def _on_new_subject(self) -> None:
+        if self._registry is None:
+            return
+        dlg = NewSubjectDialog(
+            self._registry,
+            owners=self._registry.owners(),
+            default_owner=self._current_owner,
+            parent=self,
+        )
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted or dlg.created is None:
+            return
+        created = dlg.created
+        if self._current_owner is not None and (
+            created.owner is None or created.owner == self._current_owner
+        ):
+            self._current_subject = created.id
+        self.refresh()
 
     # ------------------------------------------------------------------
     # Correlation creation
@@ -575,12 +804,14 @@ class NotesBrowserWindow(QtWidgets.QMainWindow):
         if sel_row < 0 or sel_row >= len(self._visible_rows):
             return
         note = self._visible_rows[sel_row]
-        entry_text = build_collection_entry(note)
+        entry_text = build_collection_entry(note, subject_label=self._subject_label)
         existing = self._collection_edit.toPlainText()
         if existing.strip():
             self._collection_edit.setPlainText(existing + "\n\n" + entry_text)
         else:
-            header = build_collection_manifest_header([note])
+            header = build_collection_manifest_header(
+                [note], subject_label=self._subject_label
+            )
             self._collection_edit.setPlainText(header + "\n\n" + entry_text)
 
     def _on_copy_collection_clipboard(self) -> None:

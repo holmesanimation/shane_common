@@ -18,9 +18,7 @@ Requires: shane_common[qt]  (PySide6>=6.5)
 
 from __future__ import annotations
 
-import time
 import traceback
-import uuid
 from datetime import datetime, timezone as _tz
 from pathlib import Path
 from typing import Any
@@ -30,19 +28,18 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QDesktopServices, QAction
 from PySide6.QtCore import QUrl
 
+from shane_common.notes.model import NoteRow, latest_revisions, note_row_from_note
 from shane_common.notes.notes_writer import (
+    OP_CREATE,
+    OP_EDIT,
+    UNSET_SUBJECT,
     Note,
     NoteType,
     NotesWriter,
-    make_note_id,
-    make_revision_id,
 )
-from shane_common.notes.notes_repository import (
-    NoteRow,
-    effective_note_id,
-    effective_revision_num,
-    latest_revisions,
-)
+from shane_common.notes.registry import NotesRegistry, get_default_registry
+from shane_common.notes.revisions import CommittedRevision, commit_revision
+from shane_common.ui.notes.subject_picker import show_subject_picker
 from shane_common.ui.spellcheck_highlighter import enable_spellcheck
 
 
@@ -51,14 +48,14 @@ from shane_common.ui.spellcheck_highlighter import enable_spellcheck
 # ---------------------------------------------------------------------------
 
 class NoteDialog(QtWidgets.QDialog):
-    """Small commit dialog for appending a v1 note via ``NotesWriter``.
+    """Small commit dialog for appending a note via ``NotesWriter``.
 
     Parameters
     ----------
     writer:
-        ``NotesWriter`` instance that owns the target JSONL path and clock.
+        ``NotesWriter`` instance that owns the target store and clock.
     owner:
-        Logical owner label forwarded to ``Note.owner``.
+        Owner key forwarded to ``Note.owner``.
     context:
         Freeform JSON-safe dict attached to the note's ``context`` field.
     instrument:
@@ -78,10 +75,12 @@ class NoteDialog(QtWidgets.QDialog):
         strategy_id: str | None = None,
         show_type_selector: bool = True,
         history_rows: list[Any] | None = None,
+        registry: NotesRegistry | None = None,
         parent: QtWidgets.QWidget | None = None,
     ) -> None:
         super().__init__(parent)
         self._writer = writer
+        self._registry = registry if registry is not None else get_default_registry()
         self._owner = str(owner)
         self._context = dict(context or {})
         self._instrument = instrument
@@ -228,29 +227,32 @@ class NoteDialog(QtWidgets.QDialog):
         chosen = menu.exec(self._history_list.viewport().mapToGlobal(pos))
         if chosen is not edit_action:
             return
-        if effective_note_id(row) is None:
-            QtWidgets.QMessageBox.information(
-                self, "Cannot Edit", "This note predates versioning and cannot be edited."
-            )
+        self._open_edit_dialog(row)
+
+    def _open_edit_dialog(self, row: Any) -> None:
+        extra = self._extra_edit_widget_factory()
+        if extra is not None:
+            self._extra_edit_widget_set_value(extra, row)
+        owner = getattr(row, "owner_key", None) or self._writer.owner
+        dlg = EditNoteDialog(
+            row,
+            self._writer.for_owner(owner),
+            registry=self._registry,
+            extra_widget=extra,
+            extra_context=self._extra_edit_widget_get_context,
+            parent=self,
+        )
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted or dlg.committed is None:
             return
-        _EditNoteDialog(self, row).exec()
+        committed = dlg.committed
+        self._record_new_revision(committed.note)
+        self._on_note_edited(row, committed.note.text, committed.context)
 
     def _record_new_revision(self, note: Note) -> None:
         """Add a just-committed note to the history cache and re-render."""
         if self._history_rows is None:
             return
-        self._history_rows.append(NoteRow(
-            schema_version=1,
-            raw={},
-            ts=note.ts,
-            wall_ts=note.wall_ts,
-            note_type=str(note.note_type),
-            text=note.text,
-            instrument=note.instrument,
-            strategy_id=note.strategy_id,
-            context=dict(note.context),
-            owner=note.owner,
-        ))
+        self._history_rows.append(note_row_from_note(note))
         self._populate_history()
 
     @staticmethod
@@ -271,20 +273,12 @@ class NoteDialog(QtWidgets.QDialog):
             return
 
         note_type: NoteType = self._type_combo.currentData() if self._type_combo is not None else NoteType.GENERAL
-        ts = float(self._writer._app_clock.now_ts) if self._writer._app_clock is not None else time.time()
-        context = dict(self._context)
-        context.setdefault("note_id", uuid.uuid4().hex)
-        context["revision_num"] = 1
-        context["op"] = "create"
-        note = Note(
-            ts=ts,
-            wall_ts=time.time(),
-            owner=self._owner,
+        note = self._writer.build_note(
             note_type=note_type,
             text=text,
             instrument=self._instrument,
             strategy_id=self._strategy_id,
-            context=context,
+            context=dict(self._context),
         )
         try:
             path = self._writer.commit(note)
@@ -323,21 +317,74 @@ class NoteDialog(QtWidgets.QDialog):
 
 
 # ---------------------------------------------------------------------------
-# _EditNoteDialog — append a new revision of an existing NoteDialog note
+# EditNoteDialog — append a new revision of an existing note
 # ---------------------------------------------------------------------------
 
-class _EditNoteDialog(QtWidgets.QDialog):
-    """Modal editor that commits a new revision line (same ``note_id``)."""
+class EditNoteDialog(QtWidgets.QDialog):
+    """Modal editor that appends a new revision (same note ID) of *row*.
 
-    def __init__(self, parent_dialog: NoteDialog, row: Any) -> None:
-        super().__init__(parent_dialog)
-        self._parent_dialog = parent_dialog
+    Used from a ``NoteDialog``'s history list and from the Notes Browser.
+
+    Parameters
+    ----------
+    row:
+        The note revision being edited.
+    writer:
+        ``NotesWriter`` bound to the note's owner.
+    registry:
+        Enables the subject controls; without one the subject is left as-is.
+    extra_widget / extra_context:
+        Optional owner-specific widget shown under the text box, and a
+        callable ``widget -> dict`` whose result is merged into the context.
+
+    After ``exec()`` returns ``Accepted``, :attr:`committed` describes what was
+    written.
+    """
+
+    def __init__(
+        self,
+        row: Any,
+        writer: NotesWriter,
+        *,
+        registry: NotesRegistry | None = None,
+        extra_widget: QtWidgets.QWidget | None = None,
+        extra_context: Any = None,
+        parent: QtWidgets.QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
         self._row = row
+        self._writer = writer
+        self._registry = registry
+        self._extra_context = extra_context
+        self._owner_key = getattr(row, "owner_key", None) or writer.owner
+        self._subject: str = getattr(row, "subject", None) or UNSET_SUBJECT
+        self._subject_popup: QtWidgets.QWidget | None = None
+        self.committed: CommittedRevision | None = None
         self.setWindowTitle("Edit Note")
         self.setMinimumWidth(460)
 
         layout = QtWidgets.QVBoxLayout(self)
         layout.setSpacing(8)
+
+        title_row = QtWidgets.QHBoxLayout()
+        title_row.addWidget(QtWidgets.QLabel("Title:"))
+        self._title_edit = QtWidgets.QLineEdit(getattr(row, "title", None) or "")
+        self._title_edit.setPlaceholderText("(none)")
+        title_row.addWidget(self._title_edit, 1)
+        layout.addLayout(title_row)
+
+        self._subject_lbl: QtWidgets.QLabel | None = None
+        self._subject_btn: QtWidgets.QPushButton | None = None
+        if registry is not None:
+            subject_row = QtWidgets.QHBoxLayout()
+            self._subject_lbl = QtWidgets.QLabel()
+            subject_row.addWidget(self._subject_lbl, 1)
+            self._subject_btn = QtWidgets.QPushButton("Subject")
+            self._subject_btn.clicked.connect(self._open_subject_picker)
+            subject_row.addWidget(self._subject_btn)
+            layout.addLayout(subject_row)
+            self._refresh_subject_label()
+
         layout.addWidget(QtWidgets.QLabel("Note:"))
         self._body_edit = QtWidgets.QPlainTextEdit()
         self._body_edit.setPlainText(getattr(row, "text", "") or "")
@@ -345,9 +392,8 @@ class _EditNoteDialog(QtWidgets.QDialog):
         layout.addWidget(self._body_edit)
         enable_spellcheck(self._body_edit)
 
-        self._extra_widget = parent_dialog._extra_edit_widget_factory()
+        self._extra_widget = extra_widget
         if self._extra_widget is not None:
-            parent_dialog._extra_edit_widget_set_value(self._extra_widget, row)
             layout.addWidget(self._extra_widget)
 
         btn_row = QtWidgets.QHBoxLayout()
@@ -365,40 +411,54 @@ class _EditNoteDialog(QtWidgets.QDialog):
         self._status_label.setWordWrap(True)
         layout.addWidget(self._status_label)
 
+    # -- subject -------------------------------------------------------------
+
+    def _refresh_subject_label(self) -> None:
+        if self._subject_lbl is not None and self._registry is not None:
+            self._subject_lbl.setText(f"Subject: {self._registry.subject_label(self._subject)}")
+
+    def _open_subject_picker(self) -> None:
+        if self._registry is None or self._subject_btn is None:
+            return
+        self._subject_popup = show_subject_picker(
+            self._subject_btn,
+            self._registry,
+            self._owner_key,
+            self._subject,
+            self._on_subject_changed,
+        )
+
+    def _on_subject_changed(self, subject_id: str) -> None:
+        self._subject = subject_id
+        self._refresh_subject_label()
+
+    # -- commit --------------------------------------------------------------
+
     @QtCore.Slot()
     def _on_commit(self) -> None:
         new_text = self._body_edit.toPlainText().strip()
         if not new_text:
             self._status_label.setText("Note text is empty.")
             return
-        parent = self._parent_dialog
-        row = self._row
         try:
             extra = (
-                parent._extra_edit_widget_get_context(self._extra_widget)
-                if self._extra_widget is not None else {}
+                self._extra_context(self._extra_widget)
+                if self._extra_widget is not None and self._extra_context is not None
+                else {}
             )
-            new_context = {**(row.context or {}), **extra}
-            new_context["revision_num"] = effective_revision_num(row) + 1
-            new_context["op"] = "edit"
-            try:
-                note_type = NoteType(row.note_type) if row.note_type else NoteType.GENERAL
-            except ValueError:
-                note_type = NoteType.GENERAL
-            note = parent._writer.build_note(
-                note_type=note_type,
+            self.committed = commit_revision(
+                self._writer,
+                self._row,
+                op=OP_EDIT,
                 text=new_text,
-                instrument=getattr(row, "instrument", None),
-                strategy_id=getattr(row, "strategy_id", None),
-                context=new_context,
+                title=self._title_edit.text(),
+                subject=self._subject,
+                context_updates=extra,
             )
-            parent._writer.commit(note)
         except Exception as exc:
             traceback.print_exc()
             self._status_label.setText(f"Error: {exc}")
             return
-        parent._record_new_revision(note)
-        parent._on_note_edited(row, new_text, new_context)
         self.accept()
 
 
@@ -746,12 +806,11 @@ class RowNoteDialog(QtWidgets.QDialog):
             self._status_label.setText("Cannot commit empty text.")
             return
 
-        note = self._writer.build_table_note(
+        writer = self._writer.for_owner(self._owner_key)
+        note = writer.build_note(
             note_id=note_id,
             revision_num=current_revision_num + 1,
-            op="edit",
-            owner_key=self._owner_key,
-            owner_label=self._owner_label,
+            op=OP_EDIT,
             owner_module=self._owner_module,
             owner_class=self._owner_class,
             table_id=self._table_id,
@@ -764,7 +823,7 @@ class RowNoteDialog(QtWidgets.QDialog):
             strategy_id=self._strategy_id,
         )
         try:
-            path = self._writer.commit_v2(note)
+            path = writer.commit(note)
             self._last_path = path
             self._open_folder_btn.setEnabled(True)
             for card in self._note_cards:
@@ -785,11 +844,10 @@ class RowNoteDialog(QtWidgets.QDialog):
             return
 
         note_type: NoteType = self._type_combo.currentData()
-        note = self._writer.build_table_note(
+        writer = self._writer.for_owner(self._owner_key)
+        note = writer.build_note(
             revision_num=1,
-            op="create",
-            owner_key=self._owner_key,
-            owner_label=self._owner_label,
+            op=OP_CREATE,
             owner_module=self._owner_module,
             owner_class=self._owner_class,
             table_id=self._table_id,
@@ -803,7 +861,7 @@ class RowNoteDialog(QtWidgets.QDialog):
             strategy_id=self._strategy_id,
         )
         try:
-            path = self._writer.commit_v2(note)
+            path = writer.commit(note)
             self._last_path = path
             self._open_folder_btn.setEnabled(True)
             self._add_card_from_note_row(_FakeNoteRow(note))
@@ -821,11 +879,11 @@ class RowNoteDialog(QtWidgets.QDialog):
 
 
 # ---------------------------------------------------------------------------
-# Minimal adapter so a freshly committed TableNote can seed a _NoteCard
+# Minimal adapter so a freshly committed table Note can seed a _NoteCard
 # ---------------------------------------------------------------------------
 
 class _FakeNoteRow:
-    """Wraps a ``TableNote`` to satisfy ``_add_card_from_note_row``'s duck-type."""
+    """Wraps a ``Note`` to satisfy ``_add_card_from_note_row``'s duck-type."""
 
     def __init__(self, note: Any) -> None:
         self.note_id = note.note_id

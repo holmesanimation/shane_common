@@ -11,25 +11,30 @@ from __future__ import annotations
 import datetime
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from shane_common.notes.notes_repository import NoteRow
+from shane_common.notes.model import NoteRow
 
 # Collection manifest schema version
 COLLECTION_SCHEMA = "notes-collection-v1"
+
+#: Maps a stored subject id to its display label (identity when not given).
+SubjectLabel = Callable[[str], str]
 
 
 # ---------------------------------------------------------------------------
 # Contents panel — single-note detail text
 # ---------------------------------------------------------------------------
 
-def format_note_contents(note: NoteRow) -> str:
+def format_note_contents(note: NoteRow, subject_label: SubjectLabel | None = None) -> str:
     """Format a single note for display in the Contents panel."""
     lines: list[str] = []
+    if note.title:
+        lines.append(f"title       : {note.title}")
+    lines.append(f"subject     : {(subject_label or str)(note.subject)}")
     if note.note_id:
         lines.append(f"note_id     : {note.note_id}")
-    if note.revision_id:
-        lines.append(f"revision_id : {note.revision_id}")
+    if note.revision_num:
         lines.append(f"revision_num: {note.revision_num}  op: {note.op}")
     if note.ts:
         try:
@@ -40,8 +45,8 @@ def format_note_contents(note: NoteRow) -> str:
             lines.append(f"ts (local)  : {dt.astimezone().strftime('%Y-%m-%d %H:%M:%S')}")
         except Exception:
             lines.append(f"ts          : {note.ts}")
-    if note.owner_key or note.owner:
-        lines.append(f"owner       : {note.owner_key or note.owner}")
+    if note.owner_key:
+        lines.append(f"owner       : {note.owner_key}")
     if note.owner_module:
         lines.append(f"module      : {note.owner_module}.{note.owner_class}")
     if note.table_id:
@@ -92,6 +97,7 @@ def format_note_contents(note: NoteRow) -> str:
 def build_collection_manifest_header(
     notes: list[NoteRow],
     notes_root: str | Path | None = None,
+    subject_label: SubjectLabel | None = None,
 ) -> str:
     """Return a fenced JSON manifest header for the collection text."""
     now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -99,11 +105,13 @@ def build_collection_manifest_header(
     for n in notes:
         entry: dict[str, Any] = {
             "note_id":      n.note_id,
-            "owner_key":    n.owner_key or n.owner,
+            "owner_key":    n.owner_key,
             "owner_module": n.owner_module,
             "owner_class":  n.owner_class,
             "table_id":     n.table_id,
             "row_id":       n.row_id,
+            "title":        n.title,
+            "subject":      (subject_label or str)(n.subject),
         }
         if n.row_ts:
             try:
@@ -132,12 +140,15 @@ def build_collection_manifest_header(
 # Individual collection entry
 # ---------------------------------------------------------------------------
 
-def build_collection_entry(note: NoteRow) -> str:
+def build_collection_entry(note: NoteRow, subject_label: SubjectLabel | None = None) -> str:
     """Return a readable Markdown entry for one note in the collection panel."""
     lines: list[str] = []
-    owner = note.owner_key or note.owner or "unknown"
+    owner = note.owner_key or "unknown"
     row_id = note.row_id or "?"
     lines.append(f"### Note: {owner} / {row_id}")
+    if note.title:
+        lines.append(f"Title: {note.title}")
+    lines.append(f"Subject: {(subject_label or str)(note.subject)}")
     if note.note_id:
         lines.append(f"note_id: {note.note_id}")
     if note.ts:
