@@ -206,6 +206,25 @@ def enum_visible_windows_for_pids(pids) -> list:
     return hwnds
 
 
+def get_window_titles(hwnds) -> list:
+    """Return the non-empty title text of each HWND.  [] on non-Windows."""
+    if os.name != "nt":
+        return []
+    titles: list = []
+    for hwnd in hwnds:
+        try:
+            length = _user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                continue
+            buf = ctypes.create_unicode_buffer(length + 1)
+            _user32.GetWindowTextW(hwnd, buf, length + 1)
+            if buf.value:
+                titles.append(buf.value)
+        except Exception:
+            pass
+    return titles
+
+
 def disable_windows(hwnds) -> list:
     """Disable each HWND and return only the HWNDs that were actually disabled.
 
